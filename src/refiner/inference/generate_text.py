@@ -144,7 +144,23 @@ def generate_text(
             if max_retries is not None:
                 payload["__refiner_max_retries"] = max_retries
             response = cast(InferenceResponse, await request(payload))
-            parsed_object = validate_structured_output(response.text, schema_info)
+            try:
+                parsed_object = validate_structured_output(response.text, schema_info)
+            except ValueError as exc:
+                reasoning_text = "".join(
+                    str(part.get("text", ""))
+                    for part in response.content
+                    if part.get("type") == "reasoning"
+                )
+                if reasoning_text:
+                    preview = reasoning_text[-2000:]
+                    exc.add_note(
+                        "inference diagnostic: "
+                        f"finish_reason={response.finish_reason!r}, "
+                        f"reasoning_chars={len(reasoning_text)}, "
+                        f"reasoning_tail={preview!r}"
+                    )
+                raise
             if parsed_object is not None:
                 response = replace(response, object=parsed_object)
             if warnings:

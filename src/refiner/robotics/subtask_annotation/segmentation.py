@@ -1,5 +1,5 @@
 from __future__ import annotations
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel
@@ -13,6 +13,8 @@ from refiner.robotics.subtask_annotation.utils import (
     GEMINI_BLOCK_NONE_SAFETY_SETTINGS,
     _blocked_prompt_reason,
     _log_on_overlapping_segments,
+    _parse_json_response_text,
+    _response_text_candidates,
     _resolve_video,
     timestamped_contact_sheets,
 )
@@ -61,7 +63,11 @@ def subtask_annotation(
     provider: InferenceProvider = GoogleEndpointProvider(model="gemini-3.5-flash"),
     video_key: str,
     output_column: str = "predicted_subtasks",
-    temperature: float = 0.1,
+    temperature: float | None = 0.1,
+    generation_params: Mapping[str, Any] | None = None,
+    prompt_suffix: str | None = None,
+    structured_output: bool = True,
+    media_first: bool = False,
     on_blocked_prompt: Literal["empty", "raise"] = "empty",
     max_concurrent_requests: int = 256,
 ) -> Callable[[Row], Any]:
@@ -71,7 +77,17 @@ def subtask_annotation(
         provider: Text-generation provider used to run the vision-language model.
         video_key: Video key to annotate.
         output_column: Row column that receives the predicted subtask segments.
-        temperature: Generation temperature passed to the provider request.
+        temperature: Generation temperature passed to the provider request. Set
+            to ``None`` to omit it for providers that reject sampling controls.
+        generation_params: Additional provider generation parameters merged into
+            every request. Per-request values such as ``temperature`` take
+            precedence.
+        prompt_suffix: Optional text appended to the annotation prompt, for
+            example a model-specific reasoning format instruction.
+        structured_output: Request provider-enforced structured output when
+            true. When false, tolerate fenced JSON or a top-level segment list.
+        media_first: Put image content before prompt text for models whose
+            multimodal chat template recommends that ordering.
         on_blocked_prompt: Behavior when the provider blocks the prompt before
             returning candidates. ``"empty"`` writes an empty segment list and
             logs the block; ``"raise"`` propagates the provider error.
@@ -104,12 +120,15 @@ def subtask_annotation(
             frames_per_sheet=_SEGMENTATION_FRAMES_PER_SHEET,
             columns=_SEGMENTATION_COLUMNS,
             quality=_SEGMENTATION_CONTACT_SHEET_QUALITY,
+            prompt_suffix=prompt_suffix,
+            media_first=media_first,
         )
         try:
             response = await _request_subtask_annotation(
                 generate_text=generate_text,
                 content=content,
                 temperature=temperature,
+                structured_output=structured_output,
             )
         except RuntimeError as exc:
             block_reason = _blocked_prompt_reason(exc)
@@ -124,11 +143,14 @@ def subtask_annotation(
                     frames_per_sheet=_SEGMENTATION_FRAMES_PER_SHEET,
                     columns=_SEGMENTATION_COLUMNS,
                     quality=_SEGMENTATION_FALLBACK_CONTACT_SHEET_QUALITY,
+                    prompt_suffix=prompt_suffix,
+                    media_first=media_first,
                 )
                 response = await _request_subtask_annotation(
                     generate_text=generate_text,
                     content=fallback_content,
                     temperature=temperature,
+                    structured_output=structured_output,
                 )
             except RuntimeError as fallback_exc:
                 fallback_block_reason = _blocked_prompt_reason(fallback_exc)
@@ -136,11 +158,7 @@ def subtask_annotation(
                     raise
                 block_reason = fallback_block_reason
             else:
-                parsed = response.object
-                if not isinstance(parsed, _SubtaskAnnotationResult):
-                    raise TypeError(
-                        "subtask_annotation expected a structured response object"
-                    )
+                parsed = _parse_subtask_annotation_response(response)
                 segments = _normalize_segments(parsed.segments)
                 return row.update(
                     {
@@ -153,9 +171,7 @@ def subtask_annotation(
                 block_reason,
             )
             return row.update({output_column: []})
-        parsed = response.object
-        if not isinstance(parsed, _SubtaskAnnotationResult):
-            raise TypeError("subtask_annotation expected a structured response object")
+        parsed = _parse_subtask_annotation_response(response)
         segments = _normalize_segments(parsed.segments)
         return row.update(
             {
@@ -166,6 +182,7 @@ def subtask_annotation(
     return generate_text(
         fn=_annotate_subtasks,
         provider=provider,
+        default_generation_params=generation_params,
         max_concurrent_requests=max_concurrent_requests,
     )
 
@@ -174,20 +191,39 @@ async def _request_subtask_annotation(
     *,
     generate_text: "GenerateTextFn",
     content: list[dict[str, Any]],
-    temperature: float,
+    temperature: float | None,
+    structured_output: bool,
 ) -> Any:
     messages = cast(list[Message], [{"role": "user", "content": content}])
+    generation_params: dict[str, Any] = {}
+    if temperature is not None:
+        generation_params["temperature"] = temperature
     return await generate_text(
         messages=messages,
-        schema=_SubtaskAnnotationResult,
+        schema=_SubtaskAnnotationResult if structured_output else None,
         provider_options={
             "google": {
                 "safetySettings": GEMINI_BLOCK_NONE_SAFETY_SETTINGS,
             }
         },
         maxRetries=4,
-        temperature=temperature,
+        **generation_params,
     )
+
+
+def _parse_subtask_annotation_response(response: Any) -> _SubtaskAnnotationResult:
+    if isinstance(response.object, _SubtaskAnnotationResult):
+        return response.object
+    last_error: Exception | None = None
+    for text in _response_text_candidates(response):
+        try:
+            value = _parse_json_response_text(text)
+            if isinstance(value, list):
+                value = {"segments": value}
+            return _SubtaskAnnotationResult.model_validate(value)
+        except (ValueError, TypeError) as exc:
+            last_error = exc
+    raise ValueError("response did not contain valid subtask segments") from last_error
 
 
 async def _subtask_annotation_content(
@@ -199,6 +235,8 @@ async def _subtask_annotation_content(
     frames_per_sheet: int,
     columns: int,
     quality: int,
+    prompt_suffix: str | None,
+    media_first: bool,
 ) -> list[dict[str, Any]]:
     file_parts: list[dict[str, Any]] = []
 
@@ -221,13 +259,10 @@ async def _subtask_annotation_content(
     instruction = "; ".join(task for task in tasks if task.strip())
     if instruction:
         text = f"{text}\nEpisode instruction: {instruction}\n"
-    return [
-        {
-            "type": "text",
-            "text": text,
-        },
-        *file_parts,
-    ]
+    if prompt_suffix and prompt_suffix.strip():
+        text = f"{text}\n{prompt_suffix.strip()}\n"
+    text_part = {"type": "text", "text": text}
+    return [*file_parts, text_part] if media_first else [text_part, *file_parts]
 
 
 def _normalize_segments(segments: list[_SubtaskSegment]) -> list[dict[str, Any]]:

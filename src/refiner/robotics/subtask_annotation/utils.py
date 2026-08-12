@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -24,6 +25,47 @@ GEMINI_BLOCK_NONE_SAFETY_SETTINGS: list[GoogleSafetySetting] = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
 ]
+
+
+def _parse_json_response_text(text: str) -> Any:
+    """Parse a JSON value from plain text, a fenced block, or surrounding prose."""
+
+    candidates = [text.strip()]
+    candidates.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    )
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        for match in re.finditer(r"[\[{]", candidate):
+            try:
+                value, _ = decoder.raw_decode(candidate[match.start() :])
+            except json.JSONDecodeError:
+                continue
+            return value
+    raise ValueError("response did not contain a valid JSON value")
+
+
+def _response_text_candidates(response: Any) -> list[str]:
+    """Return final text first, followed by non-duplicate reasoning text."""
+
+    candidates: list[str] = []
+    final_text = str(getattr(response, "text", "") or "").strip()
+    if final_text:
+        candidates.append(final_text)
+    for part in getattr(response, "content", ()):
+        if part.get("type") not in {"text", "reasoning"}:
+            continue
+        text = str(part.get("text", "") or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+    return candidates
 
 
 @dataclass(frozen=True, slots=True)

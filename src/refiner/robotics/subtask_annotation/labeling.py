@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -17,6 +18,8 @@ from refiner.robotics.subtask_annotation.utils import (
     _blocked_prompt_reason,
     _normalize_input_segments,
     _normalize_label,
+    _parse_json_response_text,
+    _response_text_candidates,
     _resolve_video,
     _segment_contact_sheets,
 )
@@ -115,7 +118,11 @@ def subtask_labeling(
     video_key: str,
     segments_column: str = "predicted_subtasks",
     output_column: str = "labeled_subtasks",
-    temperature: float = 0.0,
+    temperature: float | None = 0.0,
+    generation_params: Mapping[str, Any] | None = None,
+    prompt_suffix: str | None = None,
+    structured_output: bool = True,
+    media_first: bool = False,
     on_blocked_prompt: Literal["seed", "raise"] = "seed",
     max_concurrent_requests: int = 256,
 ) -> Callable[[Row], Any]:
@@ -141,7 +148,17 @@ def subtask_labeling(
             ``subtask`` value. Keeping this separate from
             ``segments_column`` preserves the original segmentation output for
             inspection or comparison.
-        temperature: Sampling temperature passed to the inference provider.
+        temperature: Sampling temperature passed to the inference provider. Set
+            to ``None`` to omit it for providers that reject sampling controls.
+        generation_params: Additional provider generation parameters merged into
+            every request. Per-request values such as ``temperature`` take
+            precedence.
+        prompt_suffix: Optional text appended to each labeling prompt, for
+            example a model-specific reasoning format instruction.
+        structured_output: Request provider-enforced structured output when
+            true. When false, tolerate a fenced JSON response.
+        media_first: Put image content before prompt text for models whose
+            multimodal chat template recommends that ordering.
         on_blocked_prompt: Behavior when the provider blocks a labeling prompt.
             ``"seed"`` writes the seed subtask fallback; ``"raise"``
             propagates the provider error.
@@ -193,16 +210,21 @@ def subtask_labeling(
                 segment_index=index,
                 instruction=instruction,
                 seed_label=seed_label,
+                prompt_suffix=prompt_suffix,
+                media_first=media_first,
             )
             messages = cast(list[Message], [{"role": "user", "content": content}])
             try:
+                request_params: dict[str, Any] = {}
+                if temperature is not None:
+                    request_params["temperature"] = temperature
                 response = await generate_text(
                     messages=messages,
-                    schema=_SubtaskLabelingResult,
+                    schema=_SubtaskLabelingResult if structured_output else None,
                     provider_options={
                         "google": {"safetySettings": GEMINI_BLOCK_NONE_SAFETY_SETTINGS}
                     },
-                    temperature=temperature,
+                    **request_params,
                 )
             except RuntimeError as exc:
                 block_reason = _blocked_prompt_reason(exc)
@@ -216,11 +238,7 @@ def subtask_labeling(
                 )
                 label = seed_label
             else:
-                parsed = response.object
-                if not isinstance(parsed, _SubtaskLabelingResult):
-                    raise TypeError(
-                        "subtask_labeling expected a structured response object"
-                    )
+                parsed = _parse_subtask_labeling_response(response)
                 label = _normalize_label(parsed.subtask) or seed_label
 
             labeled = dict(segment)
@@ -232,8 +250,39 @@ def subtask_labeling(
     return generate_text(
         fn=_label_subtasks,
         provider=provider,
+        default_generation_params=generation_params,
         max_concurrent_requests=max_concurrent_requests,
     )
+
+
+def _parse_subtask_labeling_response(response: Any) -> _SubtaskLabelingResult:
+    if isinstance(response.object, _SubtaskLabelingResult):
+        return response.object
+    candidates = _response_text_candidates(response)
+    for text in candidates:
+        try:
+            value = _parse_json_response_text(text)
+        except ValueError:
+            continue
+        if isinstance(value, str):
+            value = {"subtask": value}
+        try:
+            return _SubtaskLabelingResult.model_validate(value)
+        except (ValueError, TypeError):
+            continue
+    if candidates:
+        plain = candidates[0].strip()
+        plain = re.sub(r"<think>.*?</think>", "", plain, flags=re.DOTALL).strip()
+        if "<answer>" in plain:
+            plain = plain.rsplit("<answer>", 1)[1]
+            plain = plain.split("</answer>", 1)[0].strip()
+        fenced = re.fullmatch(r"```(?:text)?\s*(.*?)```", plain, re.DOTALL)
+        if fenced:
+            plain = fenced.group(1).strip()
+        plain = plain.strip(" \t\r\n\"'")
+        if plain:
+            return _SubtaskLabelingResult(subtask=plain)
+    raise ValueError("response did not contain a subtask label")
 
 
 async def _subtask_labeling_content(
@@ -244,6 +293,8 @@ async def _subtask_labeling_content(
     segment_index: int,
     instruction: str,
     seed_label: str,
+    prompt_suffix: str | None,
+    media_first: bool,
 ) -> list[dict[str, Any]]:
     segment = segments[segment_index]
     start_sec = float(segment["start_sec"])
@@ -261,6 +312,8 @@ async def _subtask_labeling_content(
         end_sec=end_sec,
         seed_label=seed_label,
     )
+    if prompt_suffix and prompt_suffix.strip():
+        text = f"{text}\n{prompt_suffix.strip()}\n"
     file_parts: list[dict[str, Any]] = []
     for neighbor_index in (segment_index - 1, segment_index, segment_index + 1):
         if 0 <= neighbor_index < len(segments):
@@ -270,7 +323,8 @@ async def _subtask_labeling_content(
         file_parts.append(
             {"type": "file", "mediaType": sheet.media_type, "data": sheet.data}
         )
-    return [{"type": "text", "text": text}, *file_parts]
+    text_part = {"type": "text", "text": text}
+    return [*file_parts, text_part] if media_first else [text_part, *file_parts]
 
 
 __all__ = ["subtask_labeling"]

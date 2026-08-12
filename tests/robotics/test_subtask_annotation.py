@@ -370,6 +370,34 @@ def test_subtask_annotation_accepts_robotics_row(tmp_path, monkeypatch) -> None:
     ]
 
 
+def test_subtask_annotation_can_omit_temperature(tmp_path, monkeypatch) -> None:
+    def _fake_generate_text(**kwargs):
+        return kwargs["fn"]
+
+    monkeypatch.setattr(inference_module, "generate_text", _fake_generate_text)
+    row = _robotics_row(tmp_path, tasks=["inspect workspace"])
+    block = mdr.robotics.subtask_annotation(
+        provider=mdr.inference.GoogleEndpointProvider(model="gemini-3.6-flash"),
+        video_key="observation.images.main",
+        temperature=None,
+    )
+    request = {}
+
+    async def _fake_request(**kwargs):
+        request.update(kwargs)
+        return InferenceResponse(
+            text="",
+            finish_reason="stop",
+            usage={},
+            response={},
+            object=_subtask_annotation_result([]),
+        )
+
+    asyncio.run(cast(Any, block)(row, _fake_request))
+
+    assert "temperature" not in request
+
+
 def test_subtask_annotation_writes_empty_segments_for_blocked_prompt(
     tmp_path,
     monkeypatch,
@@ -689,6 +717,43 @@ def test_subtask_labeling_ignores_label_field_for_seed_labels(
     assert result["labeled_subtasks"] == [
         {"start_sec": 0.0, "end_sec": 0.2, "subtask": "pull open drawer"}
     ]
+
+
+def test_subtask_labeling_can_omit_temperature(tmp_path, monkeypatch) -> None:
+    def _fake_generate_text(**kwargs):
+        return kwargs["fn"]
+
+    monkeypatch.setattr(inference_module, "generate_text", _fake_generate_text)
+    row = _lerobot_row(
+        tmp_path,
+        extra={
+            "predicted_subtasks": [
+                {"start_sec": 0.0, "end_sec": 0.2, "subtask": "move object"}
+            ]
+        },
+    )
+    block = mdr.robotics.subtask_labeling(
+        provider=mdr.inference.GoogleEndpointProvider(model="gemini-3.6-flash"),
+        video_key="observation.images.main",
+        temperature=None,
+    )
+    request = {}
+
+    async def _fake_request(**kwargs):
+        request.update(kwargs)
+        return InferenceResponse(
+            text="",
+            finish_reason="stop",
+            usage={},
+            response={},
+            object=subtask_labeling_module._SubtaskLabelingResult(
+                subtask="move object"
+            ),
+        )
+
+    asyncio.run(cast(Any, block)(row, _fake_request))
+
+    assert "temperature" not in request
 
 
 def test_subtask_labeling_uses_plain_prompt_without_seed_labels(
