@@ -781,6 +781,10 @@ def _google_usage(usage_metadata: Mapping[str, Any]) -> Mapping[str, Any]:
         usage["completion_tokens"] = usage_metadata["candidatesTokenCount"]
     if "totalTokenCount" in usage_metadata:
         usage["total_tokens"] = usage_metadata["totalTokenCount"]
+    if "thoughtsTokenCount" in usage_metadata:
+        usage["reasoning_tokens"] = usage_metadata["thoughtsTokenCount"]
+    if "cachedContentTokenCount" in usage_metadata:
+        usage["cached_tokens"] = usage_metadata["cachedContentTokenCount"]
     return usage
 
 

@@ -255,6 +255,8 @@ def test_google_endpoint_client_posts_generate_content(monkeypatch) -> None:
                     "promptTokenCount": 3,
                     "candidatesTokenCount": 2,
                     "totalTokenCount": 5,
+                    "thoughtsTokenCount": 1,
+                    "cachedContentTokenCount": 2,
                 },
             }
 
@@ -287,6 +289,8 @@ def test_google_endpoint_client_posts_generate_content(monkeypatch) -> None:
         "prompt_tokens": 3,
         "completion_tokens": 2,
         "total_tokens": 5,
+        "reasoning_tokens": 1,
+        "cached_tokens": 2,
     }
     assert seen["headers"] == {"x-goog-api-key": "secret"}
     assert seen["path"] == "models/gemini-2.5-flash:generateContent"
